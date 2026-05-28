@@ -22,10 +22,9 @@ app = FastAPI(title="TestGen AI v7", version="7.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
-
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "llama-3.3-70b-versatile")
-MONGO_URI    = os.environ.get("MONGO_URI",    "")
+GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "mixtral-8x7b-32768")
+MONGO_URI    = os.environ.get("MONGO_URI",     "")
 
 _mongo     = AsyncIOMotorClient(
     MONGO_URI if MONGO_URI else "mongodb://localhost:27017",
