@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: testgen-ai-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    rootDir: backend
+    envVars:
+      - key: MONGO_URI
+        sync: false          # set this in Render dashboard
+      - key: GROQ_API_KEY
+        sync: false          # set this in Render dashboard
+      - key: GROQ_MODEL
+        value: mixtral-8x7b-32768

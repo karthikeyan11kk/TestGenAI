@@ -1,0 +1,15 @@
+# Environment files — never commit these
+.env
+.env.local
+*.env
+backend/.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+dist/
+.vite/
