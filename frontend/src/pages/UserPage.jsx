@@ -15,7 +15,9 @@ function downloadExcel(data) {
 
 function fmtDate(iso) {
   if (!iso) return ''
-  const d=new Date(iso), t=new Date()
+  const normalized = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z'
+  const d = new Date(normalized), t = new Date()
+  if (isNaN(d.getTime())) return ''
   return d.toDateString()===t.toDateString()
     ? d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
     : d.toLocaleDateString([],{month:'short',day:'numeric',year:'2-digit'})

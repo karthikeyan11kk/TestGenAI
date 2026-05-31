@@ -16,7 +16,7 @@ function Navbar({ user, status, onLogout }) {
           color: online?'#3ecf8e':'#f66060',
           border:`1px solid ${online?'rgba(62,207,142,.25)':'rgba(246,96,96,.25)'}` }}>
           <span style={{ width:6, height:6, borderRadius:'50%', background:online?'#3ecf8e':'#f66060', boxShadow:online?'0 0 5px #3ecf8e':'none' }} />
-          {online ? `Groq · ${status.active_model}` : 'LLM offline'}
+          {online ? `Groq` : 'LLM offline'}
         </span>
       </div>
 

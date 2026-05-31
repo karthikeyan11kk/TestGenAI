@@ -22,9 +22,9 @@ app = FastAPI(title="TestGen AI v7", version="7.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "mixtral-8x7b-32768")
-MONGO_URI    = os.environ.get("MONGO_URI",     "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
+GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "").strip().strip('"').strip("'")
+MONGO_URI    = os.environ.get("MONGO_URI",     "").strip().strip('"').strip("'")
 
 _mongo     = AsyncIOMotorClient(
     MONGO_URI if MONGO_URI else "mongodb://localhost:27017",
@@ -96,7 +96,20 @@ async def call_llm(sys_p:str, usr_p:str, max_tokens:int=4096) -> str:
             messages=[{"role":"system","content":sys_p},{"role":"user","content":usr_p}],
             temperature=0.1,max_tokens=max_tokens)
         return resp.choices[0].message.content or ""
-    except Exception as e: raise HTTPException(502,f"Groq error: {e}")
+    except Exception as e:
+        err=str(e).lower()
+        original=str(e)
+        if "401" in err or "invalid api key" in err or "authentication" in err or "expired" in err:
+            raise HTTPException(401,
+                "Groq API key expired or invalid. Get a new key at https://console.groq.com → API Keys, "
+                "then update GROQ_API_KEY in Render environment variables and redeploy.")
+        if "429" in err or "rate limit" in err or "quota" in err or "too many" in err:
+            # Extract "Please try again in Xm Ys" from the error message
+            import re as _re
+            retry_match = _re.search(r'[Pp]lease try again in (\d+(?:m\d+(?:\.\d+)?s?|\.\d+s|s))', original)
+            retry_info = f" Please try again in {retry_match.group(1).strip()}." if retry_match else " Please wait a minute and try again."
+            raise HTTPException(429, f"Groq rate limit reached.Try Again Tomorrow")
+        raise HTTPException(502,f"Groq error: {e}")
 
 def repair_json(raw:str) -> str:
     text=raw.strip()
@@ -347,206 +360,387 @@ async def del_matrix(doc_id:str):
     except: raise HTTPException(400,"Invalid ID")
     await matrix_col.delete_one({"_id":oid}); return {"status":"deleted"}
 
+
 @app.post("/api/matrix")
-async def generate_matrix(file:UploadFile=File(...), user_email:str=Form(...)):
+async def generate_matrix(file: UploadFile = File(...), user_email: str = Form(...)):
     check_llm()
-    if not OPENPYXL_OK: raise HTTPException(500,"openpyxl not installed")
-    content_bytes=await file.read()
-    try: wb_in=openpyxl.load_workbook(io.BytesIO(content_bytes))
-    except Exception as e: raise HTTPException(400,f"Cannot read Excel: {e}")
-    ws_in=wb_in.active
+    if not OPENPYXL_OK:
+        raise HTTPException(500, "openpyxl not installed")
+
+    content_bytes = await file.read()
+    try:
+        wb_in = openpyxl.load_workbook(io.BytesIO(content_bytes))
+    except Exception as e:
+        raise HTTPException(400, f"Cannot read Excel: {e}")
+    ws_in = wb_in.active
 
     # ── Detect header row ─────────────────────────────────────────────────────
-    header_row=1; data_start=2
-    for r in range(1,min(15,ws_in.max_row+1)):
-        vals=[str(ws_in.cell(r,c).value or "").lower() for c in range(1,9)]
-        joined=" ".join(vals)
-        if "functional" in joined or ("req" in joined and "id" in joined) or "req. id" in joined:
-            header_row=r; data_start=r+1; break
+    data_start = 2
+    for r in range(1, min(15, ws_in.max_row + 1)):
+        vals = [str(ws_in.cell(r, c).value or "").lower() for c in range(1, 9)]
+        if any(k in " ".join(vals) for k in ["functional", "req. id", "req id", "requirement"]):
+            data_start = r + 1
+            break
 
-    # ── Read all requirements (keep FULL acs text) ────────────────────────────
-    requirements=[]
-    for row in range(data_start,ws_in.max_row+1):
-        cols=[ws_in.cell(row,c).value for c in range(1,9)]
-        if not any(cols): continue
-        req_id=str(cols[3] or ""); req_desc=str(cols[4] or ""); req_stmt=str(cols[5] or "")
-        acs=str(cols[6] or "")  # keep FULL text - critical for accurate mapping
-        if not req_id and not req_desc and not acs: continue
+    # ── Read requirements ─────────────────────────────────────────────────────
+    requirements = []
+    for row in range(data_start, ws_in.max_row + 1):
+        cols = [ws_in.cell(row, c).value for c in range(1, 9)]
+        if not any(cols):
+            continue
+        req_id   = str(cols[3] or "")
+        req_desc = str(cols[4] or "")
+        req_stmt = str(cols[5] or "")
+        acs      = str(cols[6] or "")
+        if not req_id and not req_desc and not acs:
+            continue
         requirements.append({
-            "row":row,"col_a":str(cols[0] or ""),"col_b":str(cols[1] or ""),
-            "col_c":str(cols[2] or ""),"req_id":req_id or f"ROW{row}",
-            "req_desc":req_desc[:300],"req_stmt":req_stmt[:300],
-            "acs":acs,"col_h":str(cols[7] or ""),
+            "row": row, "col_a": str(cols[0] or ""), "col_b": str(cols[1] or ""),
+            "col_c": str(cols[2] or ""), "req_id": req_id or f"ROW{row}",
+            "req_desc": req_desc[:300], "req_stmt": req_stmt[:300],
+            "acs": acs, "col_h": str(cols[7] or ""),
         })
     if not requirements:
-        raise HTTPException(400,"No requirements found. Check Excel has Req ID in column D.")
+        raise HTTPException(400, "No requirements found. Check Excel has Req ID in column D.")
 
-    # ── JSON parse helper ─────────────────────────────────────────────────────
-    def try_parse(raw:str) -> dict:
+    # ── Detect migration pattern ──────────────────────────────────────────────
+    all_text = " ".join(r["col_c"] + " " + r["req_desc"] + " " + r["acs"][:100]
+                        for r in requirements).lower()
+    if "nig" in all_text or " ng" in all_text or "m2" in all_text:
+        pattern = "M2"
+    elif "rsa" in all_text or "m1" in all_text:
+        pattern = "M1"
+    else:
+        pattern = "R1"
+
+    # ── LLM helper ────────────────────────────────────────────────────────────
+    def try_parse(raw):
         if not raw: return {}
         try: return json.loads(repair_json(raw))
         except: pass
         try:
             import ast as _a
-            m=re.search(r"\{.*\}",raw,re.DOTALL)
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
             if m: return json.loads(json.dumps(_a.literal_eval(m.group())))
         except: pass
         return {}
 
-    async def matrix_call(sp:str, up:str, mt:int=2000) -> dict:
-        raw=await call_llm(sp,up,mt)
-        r=try_parse(raw)
-        if r and (r.get("scenarios") or r.get("mappings")): return r
-        raw2=await call_llm("Output ONLY valid JSON. No text. Start with {",f"JSON for:\n{up[:400]}")
-        return try_parse(raw2)
-
-    # ── Step 1: Generate scenario headings ────────────────────────────────────
-    sample_reqs=", ".join(f"[{r['req_id']}] {r['req_desc'][:80]}" for r in requirements[:20])
-    sc_sys=(
-        "You are a QA analyst for Acturis insurance. Output ONLY JSON. Start with {. No text.\n"
-        "Generate meaningful E2E Acturis test scenario headings covering the given requirements."
-    )
-    sc_usr=(
-        f"Requirements ({len(requirements)} total):\n{sample_reqs}\n\n"
-        "Generate 8-20 Acturis E2E test scenario headings. Be specific and descriptive.\n"
-        "Return ONLY: {\"scenarios\":[{\"number\":1,\"name\":\"Full Scenario Name\",\"section\":\"Core Functionality\"}]}\n"
-        "Start with {"
-    )
-    sc_data=await matrix_call(sc_sys,sc_usr,2000)
-    scenarios=sc_data.get("scenarios",[])
-    if not scenarios:
-        raise HTTPException(500,"Could not generate scenarios. Check GROQ_API_KEY and retry.")
-
-    sc_list="\n".join(f"SC{s['number']}: {s['name']}" for s in scenarios)
-
-    # ── Step 2: Map requirements in batches of 5 with FULL scenario list ──────
-    # Each batch sees ALL scenario names so matching is content-based and accurate
-    BATCH=5; all_mappings:dict={}
-    mp_sys=(
-        "You are a QA matrix analyst for Acturis insurance. Output ONLY JSON. Start with {. No text.\n"
-        "Task: Read each requirement's AC/s text and map it to the matching test scenario(s).\n"
-        "Rules:\n"
-        "1. Read the full AC/s text - it describes what is being tested using GIVEN/WHEN/THEN format.\n"
-        "2. Match based on CONTENT SIMILARITY between AC description and scenario name.\n"
-        "3. Extract AC codes EXACTLY as written in the AC/s text (AC01, AC1, AC1,AC2,AC3 etc).\n"
-        "   - If text has explicit 'ACxx' codes, use those exactly.\n"
-        "   - If text has 'Scenario 1...', 'Scenario 2...' blocks, count them as AC01,AC02 etc.\n"
-        "4. A requirement can map to multiple scenarios if it has ACs covering different flows.\n"
-        "5. Leave scenario empty if the content does not genuinely match."
-    )
-    for i in range(0,len(requirements),BATCH):
-        batch=requirements[i:i+BATCH]
-        reqs_block="\n\n---\n\n".join(
-            f"REQ [{r['req_id']}]\nDescription: {r['req_desc'][:150]}\nFull AC/s text:\n{r['acs'][:700]}"
-            for r in batch
+    async def llm_call(sp, up, mt=2500):
+        raw = await call_llm(sp, up, mt)
+        r = try_parse(raw)
+        if r: return r
+        # retry once
+        raw2 = await call_llm(
+            "Output ONLY valid JSON. No explanation. Start with {",
+            f"Return JSON for:\n{up[:400]}"
         )
-        mp_usr=(
-            f"ALL TEST SCENARIOS:\n{sc_list}\n\n"
-            f"REQUIREMENTS TO MAP:\n{reqs_block}\n\n"
-            "For each requirement, find the scenario(s) whose name matches the AC content.\n"
-            "Use the EXACT AC codes from the AC/s text.\n"
-            "Return ONLY: {\"mappings\":[{\"req_id\":\"PVII-XXX\",\"scenario_mappings\":{\"1\":\"AC01\",\"3\":\"AC1,AC2,AC3\"}}]}\n"
+        return try_parse(raw2) or {}
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STEP 1 — Generate scenario headings
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Build context from actual AC content
+    ac_samples = "\n\n".join(
+        f"[{r['req_id']}] {r['req_desc'][:60]}\nAC text: {r['acs'][:200]}"
+        for r in requirements[:12]
+    )
+
+    sc_resp = await llm_call(
+        "You are a QA analyst for Acturis insurance. Output ONLY JSON. Start with {.",
+        (
+            f"Analyse these Acturis {pattern} migration requirements and generate "
+            f"8-21 distinct E2E test scenario headings.\n\n"
+            "Rules for scenario names:\n"
+            "- Each name describes ONE specific end-to-end Acturis test flow\n"
+            "- Format: '[Renewal type] - [Specific flow description]'\n"
+            "- Be specific: include key actions like 'MTA', 'Claims', 'Endorsements', 'Accept Wizard'\n"
+            "- Example good names:\n"
+            "  * 'Intact Renewal - Non-Risk Updates - Validate and Accept Renewal'\n"
+            "  * 'Intact Renewal - Risk Update at Quote Level - ProductWriter Refers - UW Authorize'\n"
+            "  * 'Intact Renewal - Perform MTA in Renewal Cycle and Reject'\n"
+            "  * 'Intact Renewal - Add Pre Inception Claims on NB - Process Renewal'\n"
+            "  * 'Intact Renewal - Verify Exclude from Auto Renewals Option'\n"
+            "- Read the AC texts carefully to identify all distinct flows\n"
+            "- Section = 'Core Functionality' for business flows, 'Tech Readiness' for data/XML\n\n"
+            f"Requirements to analyse:\n{ac_samples}\n\n"
+            "Return: {\"scenarios\":[{\"number\":1,\"name\":\"Intact Renewal - ...\","
+            "\"section\":\"Core Functionality\"}]}\n"
             "Start with {"
+        ),
+        3000
+    )
+    scenarios = sc_resp.get("scenarios", [])
+    if not scenarios:
+        raise HTTPException(500, "Could not generate scenarios. Retry or check GROQ_API_KEY.")
+
+    sc_list = "\n".join(f"{s['number']}. {s['name']}" for s in scenarios)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STEP 2 — Map requirements to scenarios in batches of 6 (token-efficient)
+    # Each batch ~2k tokens → 35 reqs = ~6 calls × 2k = ~12k tokens per matrix
+    # ═══════════════════════════════════════════════════════════════════════════
+    all_mappings = {}
+    sc_lookup = "\n".join(f"  {s['number']}. {s['name']}" for s in scenarios)
+    BATCH = 6
+
+    for batch_start in range(0, len(requirements), BATCH):
+        batch = requirements[batch_start:batch_start + BATCH]
+
+        req_lines = []
+        for r in batch:
+            acs_short = r["acs"][:400].replace("\n", " ")
+            req_lines.append(f"[{r['req_id']}] {r['req_desc'][:80]} | ACs: {acs_short}")
+
+        resp = await llm_call(
+            "QA matrix analyst. Output ONLY JSON. Start with {.",
+            (
+                "Map requirements to scenarios. Return compact JSON.\n\n"
+                f"SCENARIOS:\n{sc_lookup}\n\n"
+                f"REQUIREMENTS:\n" + "\n".join(req_lines) + "\n\n"
+                "RULES:\n"
+                "- Match each req to the scenario whose name best fits its AC content.\n"
+                "- Same flow → put ALL codes in ONE scenario: {\"2\":\"AC01,AC02,AC03\"}\n"
+                "- Different flows → split: {\"4\":\"AC01\",\"7\":\"AC02\"}\n"
+                "- Values = AC codes (AC01, AC1,AC2) NEVER scenario numbers.\n\n"
+                "{\"mappings\":[{\"req_id\":\"ID\",\"scenario_mappings\":{\"sc_num\":\"AC_codes\"}}]}\n"
+                "Start with {"
+            ),
+            2000
         )
-        try:
-            mp_data=await matrix_call(mp_sys,mp_usr,3000)
-            for m in mp_data.get("mappings",[]):
-                rid=str(m.get("req_id",""))
-                if rid:
-                    all_mappings[rid]=m.get("scenario_mappings",{})
-        except Exception:
-            pass  # continue with other batches
 
-    # Partial key match fallback
+        for m in resp.get("mappings", []):
+            rid = str(m.get("req_id", ""))
+            sm  = m.get("scenario_mappings", {})
+            if not rid or not sm:
+                continue
+            clean = {}
+            for k, v in sm.items():
+                v_str = str(v).strip()
+                if re.match(r'^\d+$', v_str):
+                    v_str = f"AC{int(v_str):02d}"
+                if v_str.upper().startswith("SC"):
+                    v_str = "AC01"
+                try:
+                    sc_num = int(str(k).strip())
+                    if 1 <= sc_num <= len(scenarios):
+                        clean[str(sc_num)] = v_str
+                except Exception:
+                    pass
+            if clean:
+                all_mappings[rid] = clean
+
+    # ── Fallback: partial key match for unmatched requirements ────────────────
     for req in requirements:
-        rid=req["req_id"]
+        rid = req["req_id"]
         if not all_mappings.get(rid):
-            for k,v in all_mappings.items():
+            for k, v in all_mappings.items():
                 if rid in k or k in rid:
-                    all_mappings[rid]=v; break
+                    all_mappings[rid] = v
+                    break
 
-    # ── Build Excel (exact sample format) ─────────────────────────────────────
-    wb_out=openpyxl.Workbook(); ws=wb_out.active; ws.title="Requirement Matrix"
-    thin=Side(style="thin",color="BFBFBF"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
-    def fill(c): return PatternFill("solid",fgColor=c)
-    def fnt(color="000000",bold=False,sz=9): return Font(color=color,bold=bold,size=sz)
-    ctr=Alignment(horizontal="center",vertical="center",wrap_text=True)
-    lwrap=Alignment(horizontal="left",vertical="top",wrap_text=True)
-    num_sc=len(scenarios)
 
-    # Row 1: Title
-    ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=8+num_sc)
-    c=ws.cell(1,1,"Requirements Traceability Matrix — E2E SIT Scenarios")
-    c.fill=fill("1F4E79"); c.font=Font(color="FFFFFF",bold=True,size=13); c.alignment=ctr
-    # Row 2: Pattern
-    ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=7)
-    ws.cell(2,1,"E2E SIT Scenario").font=fnt(bold=True,sz=9)
-    ws.cell(2,8,"Pattern").font=fnt(bold=True,sz=9)
-    for i,sc in enumerate(scenarios):
-        c=ws.cell(2,9+i,"R1"); c.fill=fill("D9E1F2"); c.font=fnt(bold=True,sz=9); c.alignment=ctr; c.border=bdr
-    # Row 3: Number
-    ws.merge_cells(start_row=3,start_column=1,end_row=3,end_column=7)
-    ws.cell(3,1,"").font=fnt(sz=9)
-    ws.cell(3,8,"Number").font=fnt(bold=True,sz=9)
-    for i,sc in enumerate(scenarios):
-        c=ws.cell(3,9+i,sc["number"]); c.fill=fill("D9E1F2"); c.font=fnt(bold=True,sz=9); c.alignment=ctr; c.border=bdr
-    # Row 4: Scenario Name
-    ws.merge_cells(start_row=4,start_column=1,end_row=4,end_column=7)
-    ws.cell(4,1,"").font=fnt(sz=9)
-    ws.cell(4,8,"Name").font=fnt(bold=True,sz=9)
-    for i,sc in enumerate(scenarios):
-        c=ws.cell(4,9+i,sc["name"]); c.fill=fill("2E75B6"); c.font=fnt("FFFFFF",True,9); c.alignment=ctr; c.border=bdr
-    # Row 5: Section
-    ws.merge_cells(start_row=5,start_column=1,end_row=5,end_column=7)
-    ws.cell(5,1,"Requirement Details").font=fnt(bold=True,sz=9)
-    ws.cell(5,8,"Section").font=fnt(bold=True,sz=9)
-    for i,sc in enumerate(scenarios):
-        c=ws.cell(5,9+i,sc.get("section","Core Functionality"))
-        c.fill=fill("4472C4"); c.font=fnt("FFFFFF",True,9); c.alignment=ctr; c.border=bdr
-    # Rows 6-9: Labels
-    for rn,lbl in [(6,"Rank"),(7,"Proposed Priority"),(8,"Agreed Priority"),(9,"Stories Covered")]:
-        ws.cell(rn,8,lbl).font=fnt(sz=8)
-    # Row 10: Headers
-    for c,lbl in enumerate(["Functional Area","BA","Product / Sub-Area","Req. ID","Req. Description","Requirement","AC/s","ACs Covered"],1):
-        cell=ws.cell(10,c,lbl); cell.fill=fill("1F4E79"); cell.font=fnt("FFFFFF",True,9); cell.alignment=ctr; cell.border=bdr
-    for i,sc in enumerate(scenarios):
-        cell=ws.cell(10,9+i,sc["number"]); cell.fill=fill("1F4E79"); cell.font=fnt("FFFFFF",True,9); cell.alignment=ctr; cell.border=bdr
-    # Rows 11+: Data
-    grn=fill("92D050"); wht=fill("FFFFFF"); alt=fill("F2F2F2")
-    for ri,req in enumerate(requirements):
-        dr=11+ri; rf=alt if ri%2==0 else wht
-        for c,val in enumerate([req["col_a"],req["col_b"],req["col_c"],req["req_id"],req["req_desc"],req["req_stmt"],req["acs"],req["col_h"]],1):
-            cell=ws.cell(dr,c,val); cell.fill=rf; cell.font=fnt(sz=9); cell.alignment=lwrap; cell.border=bdr
-        rid=req["req_id"]; mapping=all_mappings.get(rid,{}); total_ac=0
-        for i,sc in enumerate(scenarios):
-            ac_val=str(mapping.get(str(sc["number"]),"")).strip()
-            cell=ws.cell(dr,9+i,ac_val if ac_val else "")
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STEP 3 — Calculate counts, remove unused scenarios, renumber
+    # ═══════════════════════════════════════════════════════════════════════════
+    sc_ac_count  = {str(sc["number"]): 0 for sc in scenarios}
+    sc_req_count = {str(sc["number"]): 0 for sc in scenarios}
+
+    for rid, mapping in all_mappings.items():
+        for sc_num, ac_val in mapping.items():
+            if ac_val and str(ac_val).strip():
+                sc_req_count[sc_num] = sc_req_count.get(sc_num, 0) + 1
+                sc_ac_count[sc_num]  = sc_ac_count.get(sc_num, 0) + len(
+                    [x for x in str(ac_val).split(",") if x.strip()])
+
+    # ── Remove scenarios with 0 requirements mapped — never show empty columns ─
+    active_scenarios = [sc for sc in scenarios
+                        if sc_req_count.get(str(sc["number"]), 0) > 0]
+
+    if not active_scenarios:
+        # Fallback: keep all if nothing mapped at all
+        active_scenarios = scenarios
+
+    # Renumber active scenarios 1..N sequentially
+    old_to_new = {}  # old_number_str → new_number
+    renumbered = []
+    for new_idx, sc in enumerate(active_scenarios):
+        new_num = new_idx + 1
+        old_to_new[str(sc["number"])] = new_num
+        renumbered.append({**sc, "number": new_num})
+
+    # Remap all_mappings to use new scenario numbers
+    remapped = {}
+    for rid, mapping in all_mappings.items():
+        new_mapping = {}
+        for old_num, ac_val in mapping.items():
+            if old_num in old_to_new:
+                new_mapping[str(old_to_new[old_num])] = ac_val
+        if new_mapping:
+            remapped[rid] = new_mapping
+    all_mappings = remapped
+    scenarios    = renumbered
+
+    # Recalculate counts with new numbering
+    sc_ac_count  = {str(sc["number"]): 0 for sc in scenarios}
+    sc_req_count = {str(sc["number"]): 0 for sc in scenarios}
+    for rid, mapping in all_mappings.items():
+        for sc_num, ac_val in mapping.items():
+            if ac_val and str(ac_val).strip():
+                sc_req_count[sc_num] = sc_req_count.get(sc_num, 0) + 1
+                sc_ac_count[sc_num]  = sc_ac_count.get(sc_num, 0) + len(
+                    [x for x in str(ac_val).split(",") if x.strip()])
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STEP 4 — Build Excel matching reference format exactly
+    # ═══════════════════════════════════════════════════════════════════════════
+    wb  = openpyxl.Workbook()
+    ws  = wb.active
+    ws.title = "Requirement Matrix"
+    # Force auto-recalculation so formulas work on open
+    wb.calculation.calcMode = "auto"
+
+    thin = Side(style="thin", color="BFBFBF")
+    bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
+    def fill(c): return PatternFill("solid", fgColor=c)
+    def fnt(color="000000", bold=False, sz=9):
+        return Font(color=color, bold=bold, size=sz)
+    ctr   = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    lwrap = Alignment(horizontal="left",   vertical="top",    wrap_text=True)
+    n = len(scenarios)
+
+    # ── ROW 1: Title ──────────────────────────────────────────────────────────
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8 + n)
+    c1 = ws.cell(1, 1, "Requirements Traceability Matrix - E2E SIT Scenarios")
+    c1.fill = fill("1F4E79"); c1.font = Font(color="FFFFFF", bold=True, size=13)
+    c1.alignment = ctr
+
+    # ── ROW 2: Pattern ────────────────────────────────────────────────────────
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=6)
+    ws.cell(2, 7, "E2E SIT Scenario").font = fnt(bold=True)
+    ws.cell(2, 8, "Pattern").font          = fnt(bold=True)
+    for i, sc in enumerate(scenarios):
+        c = ws.cell(2, 9 + i, pattern)
+        c.fill = fill("D9E1F2"); c.font = fnt(bold=True); c.alignment = ctr; c.border = bdr
+
+    # ── ROW 3: Scenario numbers ───────────────────────────────────────────────
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=6)
+    ws.cell(3, 8, "Number").font = fnt(bold=True)
+    for i, sc in enumerate(scenarios):
+        c = ws.cell(3, 9 + i, sc["number"])
+        c.fill = fill("D9E1F2"); c.font = fnt(bold=True); c.alignment = ctr; c.border = bdr
+
+    # ── ROW 4: Scenario names ─────────────────────────────────────────────────
+    ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=7)
+    ws.cell(4, 8, "Name").font = fnt(bold=True)
+    for i, sc in enumerate(scenarios):
+        c = ws.cell(4, 9 + i, sc["name"])
+        c.fill = fill("2E75B6"); c.font = fnt("FFFFFF", True)
+        c.alignment = ctr; c.border = bdr
+
+    # ── ROW 5: Section ────────────────────────────────────────────────────────
+    ws.merge_cells(start_row=5, start_column=1, end_row=5, end_column=7)
+    ws.cell(5, 1, "Requirement Details").font = fnt(bold=True)
+    ws.cell(5, 8, "Section").font             = fnt(bold=True)
+    for i, sc in enumerate(scenarios):
+        c = ws.cell(5, 9 + i, sc.get("section", "Core Functionality"))
+        c.fill = fill("4472C4"); c.font = fnt("FFFFFF", True)
+        c.alignment = ctr; c.border = bdr
+
+    # ── ROW 6: Rank — total AC count per scenario (STATIC — never shows 0) ───
+    ws.cell(6, 8, "Rank").font = fnt(bold=True)
+    max_ac = max(sc_ac_count.values()) if sc_ac_count else 1
+    for i, sc in enumerate(scenarios):
+        cnt = sc_ac_count.get(str(sc["number"]), 0)
+        c = ws.cell(6, 9 + i, cnt)
+        c.fill = fill("EEF2FF"); c.font = fnt(); c.alignment = ctr; c.border = bdr
+
+    # ── ROW 7: Proposed Priority ──────────────────────────────────────────────
+    ws.cell(7, 8, "Proposed Priority").font = fnt(bold=True)
+    for i, sc in enumerate(scenarios):
+        cnt   = sc_ac_count.get(str(sc["number"]), 0)
+        ratio = cnt / (max_ac or 1)
+        pri   = "High" if ratio >= 0.7 else ("Medium" if ratio >= 0.2 else "Low")
+        col   = "C00000" if pri == "High" else ("ED7D31" if pri == "Medium" else "70AD47")
+        c = ws.cell(7, 9 + i, pri)
+        c.fill = fill("EEF2FF"); c.font = fnt(col, True); c.alignment = ctr; c.border = bdr
+
+    # ── ROW 8: Agreed Priority (blank for manual input) ───────────────────────
+    ws.cell(8, 8, "Agreed Priority").font = fnt(bold=True)
+    for i in range(n):
+        ws.cell(8, 9 + i, "").border = bdr
+
+    # ── ROW 9: Stories Covered — STATIC count (no formula = no 0 bug) ────────
+    ws.cell(9, 8, "Stories Covered").font = fnt(bold=True)
+    for i, sc in enumerate(scenarios):
+        cnt = sc_req_count.get(str(sc["number"]), 0)
+        c = ws.cell(9, 9 + i, cnt)
+        c.fill = fill("D9E1F2"); c.font = fnt(bold=True); c.alignment = ctr; c.border = bdr
+
+    # ── ROW 10: Column headers + total AC count ───────────────────────────────
+    for c, lbl in enumerate(["Functional Area", "BA", "Product / Sub-Area", "Req. ID",
+                               "Req. Description", "Requirement", "AC/s", "ACs Covered"], 1):
+        cell = ws.cell(10, c, lbl)
+        cell.fill = fill("1F4E79"); cell.font = fnt("FFFFFF", True)
+        cell.alignment = ctr; cell.border = bdr
+    for i, sc in enumerate(scenarios):
+        cnt = sc_ac_count.get(str(sc["number"]), 0)
+        c = ws.cell(10, 9 + i, cnt if cnt else "")
+        c.fill = fill("1F4E79"); c.font = fnt("FFFFFF", True)
+        c.alignment = ctr; c.border = bdr
+
+    # ── ROWS 11+: Data ────────────────────────────────────────────────────────
+    grn = fill("92D050"); wht = fill("FFFFFF"); alt = fill("F2F2F2")
+    for ri, req in enumerate(requirements):
+        dr = 11 + ri
+        rf = alt if ri % 2 == 0 else wht
+        for c, val in enumerate([req["col_a"], req["col_b"], req["col_c"], req["req_id"],
+                                   req["req_desc"], req["req_stmt"], req["acs"], req["col_h"]], 1):
+            cell = ws.cell(dr, c, val)
+            cell.fill = rf; cell.font = fnt(); cell.alignment = lwrap; cell.border = bdr
+
+        mapping  = all_mappings.get(req["req_id"], {})
+        total_ac = 0
+        for i, sc in enumerate(scenarios):
+            ac_val = str(mapping.get(str(sc["number"]), "")).strip()
+            cell   = ws.cell(dr, 9 + i, ac_val if ac_val else "")
             if ac_val:
-                cell.fill=grn; cell.font=fnt("000000",True,9)
-                total_ac+=len([x for x in ac_val.split(",") if x.strip()])
-            else: cell.fill=rf; cell.font=fnt(sz=9)
-            cell.alignment=ctr; cell.border=bdr
-        if total_ac>0: ws.cell(dr,8,total_ac).font=fnt(sz=9)
+                cell.fill = grn; cell.font = fnt("000000", True)
+                total_ac += len([x for x in ac_val.split(",") if x.strip()])
+            else:
+                cell.fill = rf; cell.font = fnt()
+            cell.alignment = ctr; cell.border = bdr
 
-    # Widths
-    for c,w in enumerate([16,10,16,13,32,38,45,10],1): ws.column_dimensions[get_column_letter(c)].width=w
-    sc_w=max(7,35//max(num_sc,1))
-    for i in range(num_sc): ws.column_dimensions[get_column_letter(9+i)].width=sc_w
-    ws.row_dimensions[4].height=55; ws.freeze_panes="I11"
+        if total_ac > 0:
+            ws.cell(dr, 8, total_ac).font = fnt()
 
-    out=io.BytesIO(); wb_out.save(out); out.seek(0); excel_bytes=out.read()
-    fname=f"Matrix_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.xlsx"
-    ins=await matrix_col.insert_one({
-        "user_email":user_email.lower(),"filename":fname,
-        "original_filename":file.filename or "uploaded.xlsx",
-        "requirements_count":len(requirements),"scenarios_count":num_sc,
-        "scenario_names":[s["name"] for s in scenarios],
-        "excel_bytes":base64.b64encode(excel_bytes).decode(),
-        "created_at":datetime.utcnow().isoformat()})
-    return Response(content=excel_bytes,
-                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    headers={"Content-Disposition":f"attachment; filename={fname}",
-                             "X-History-Id":str(ins.inserted_id)})
+    # ── Column widths & freeze ────────────────────────────────────────────────
+    for c, w in enumerate([16, 10, 16, 13, 32, 38, 45, 10], 1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    sc_w = max(7, 35 // max(n, 1))
+    for i in range(n):
+        ws.column_dimensions[get_column_letter(9 + i)].width = sc_w
+    ws.row_dimensions[4].height = 55
+    ws.freeze_panes = "I11"
+
+    # ── Save & store ──────────────────────────────────────────────────────────
+    out = io.BytesIO(); wb.save(out); out.seek(0); excel_bytes = out.read()
+    fname = f"Matrix_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.xlsx"
+    ins = await matrix_col.insert_one({
+        "user_email": user_email.lower(), "filename": fname,
+        "original_filename": file.filename or "uploaded.xlsx",
+        "requirements_count": len(requirements), "scenarios_count": n,
+        "scenario_names": [s["name"] for s in scenarios],
+        "excel_bytes": base64.b64encode(excel_bytes).decode(),
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={fname}",
+                 "X-History-Id": str(ins.inserted_id)},
+    )
+
+
 
 @app.get("/api/llm/status")
 async def llm_status():

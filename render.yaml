@@ -13,4 +13,4 @@ services:
       - key: GROQ_API_KEY
         sync: false          # set this in Render dashboard
       - key: GROQ_MODEL
-        value: mixtral-8x7b-32768
+        value: llama-3.1-8b-instant

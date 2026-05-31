@@ -3,10 +3,14 @@ import { api } from '../api'
 
 function fmtDate(iso) {
   if (!iso) return ''
-  const d = new Date(iso), t = new Date()
-  return d.toDateString() === t.toDateString()
+  // MongoDB stores UTC without Z — add Z so JS parses as UTC not local time
+  const normalized = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z'
+  const d = new Date(normalized)
+  if (isNaN(d.getTime())) return ''
+  const today = new Date()
+  return d.toDateString() === today.toDateString()
     ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' })
 }
 
 // ── TC History list ───────────────────────────────────────────────────────────
