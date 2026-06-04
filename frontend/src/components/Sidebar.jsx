@@ -222,8 +222,8 @@ export default function Sidebar({ user, activeId, onLoad, onNew, refreshTrigger,
         {/* Tab buttons */}
         <div style={{ display: 'flex', gap: 4, marginBottom: 0 }}>
           {[
-            { key: 'tc',     label: '🧪 Test Cases' },
-            { key: 'matrix', label: '📊 Matrix'     },
+            // { key: 'tc',     label: '🧪 Test Cases' },
+            // { key: 'matrix', label: '📊 Matrix'     },
           ].map(t => (
             <button key={t.key} onClick={() => setActiveTab(t.key)}
               style={{

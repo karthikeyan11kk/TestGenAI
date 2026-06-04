@@ -304,7 +304,7 @@ export default function UserPage({ user }) {
         {/* Tabs */}
         <div style={{ display:'flex',gap:8,marginBottom:22,flexShrink:0 }}>
           <TabBtn label="🧪 Test Case Design" active={tab==='tc'}     onClick={()=>setTab('tc')}/>
-          <TabBtn label="📊 Matrix Design"    active={tab==='matrix'} onClick={()=>setTab('matrix')}/>
+          {/* <TabBtn label="📊 Matrix Design"    active={tab==='matrix'} onClick={()=>setTab('matrix')}/> */}
         </div>
 
         {tab==='tc'&&<TestCaseDesignTab user={user} options={options} historyItem={historyItem}
